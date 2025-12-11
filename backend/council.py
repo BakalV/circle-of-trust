@@ -1,8 +1,36 @@
-"""3-stage LLM Council orchestration."""
+"""3-stage Circle of Trust orchestration."""
 
 from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .ollama_client import query_advisors_parallel, query_ollama
+from .config import CHAIRMAN_MODEL
+
+
+def clean_response_content(content: str) -> str:
+    """
+    Clean the response content by removing <think> tags and other artifacts.
+    
+    Args:
+        content: Raw response string
+        
+    Returns:
+        Cleaned response string
+    """
+    import re
+    
+    if not content:
+        return ""
+        
+    # Remove <think>...</think> blocks (including multiline)
+    # Using dotall flag to match newlines
+    cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    
+    # Remove standalone <think> or </think> tags if any remain
+    cleaned = re.sub(r'</?think>', '', cleaned)
+    
+    # Trim whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,18 +43,16 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
-
-    # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Query all advisors in parallel
+    responses = await query_advisors_parallel(user_query)
 
     # Format results
     stage1_results = []
-    for model, response in responses.items():
+    for advisor_name, response in responses.items():
         if response is not None:  # Only include successful responses
             stage1_results.append({
-                "model": model,
-                "response": response.get('content', '')
+                "model": advisor_name, # Using advisor name as the identifier
+                "response": clean_response_content(response.get('content', ''))
             })
 
     return stage1_results
@@ -92,19 +118,18 @@ FINAL RANKING:
 
 Now provide your evaluation and ranking:"""
 
-    messages = [{"role": "user", "content": ranking_prompt}]
-
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Get rankings from all council advisors in parallel
+    # They will use their personas to evaluate
+    responses = await query_advisors_parallel(ranking_prompt)
 
     # Format results
     stage2_results = []
-    for model, response in responses.items():
+    for advisor_name, response in responses.items():
         if response is not None:
-            full_text = response.get('content', '')
+            full_text = clean_response_content(response.get('content', ''))
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
-                "model": model,
+                "model": advisor_name,
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
@@ -130,16 +155,16 @@ async def stage3_synthesize_final(
     """
     # Build comprehensive context for chairman
     stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
+        f"Advisor: {result['model']}\nResponse: {result['response']}"
         for result in stage1_results
     ])
 
     stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
+        f"Advisor: {result['model']}\nRanking: {result['ranking']}"
         for result in stage2_results
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    chairman_prompt = f"""You are the Chairman of an Circle of Trust. Multiple AI advisors have provided responses to a user's question, and then ranked each other's responses.
 
 Original Question: {user_query}
 
@@ -159,18 +184,20 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     messages = [{"role": "user", "content": chairman_prompt}]
 
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    # We use query_ollama directly here as the chairman might not be one of the advisors acting in persona,
+    # or we want to override the persona with the "Chairman" role.
+    response = await query_ollama(CHAIRMAN_MODEL, messages)
 
     if response is None:
         # Fallback if chairman fails
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": "Andrej Karpathy (Chairman)",
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
+        "model": "Andrej Karpathy (Chairman)",
+        "response": clean_response_content(response.get('content', ''))
     }
 
 
@@ -274,8 +301,8 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    # Use mistral for title generation (fast and available)
+    response = await query_ollama("mistral:latest", messages, timeout=30.0)
 
     if response is None:
         # Fallback to a generic title

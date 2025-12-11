@@ -1,1 +1,1 @@
-"""LLM Council backend package."""
+"""Circle of Trust backend package."""

@@ -4,18 +4,51 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+llm_council.egg-info/
+.mypy_cache/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+.python-version
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
 
 # Keys and secrets
 .env
+.env.local
+.env.*.local
 
-# Data files
-data/
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files (runtime generated)
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 
 # Frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+
+# Logs
+*.log
+logs/
+
+# Lock files (comment out if you want to commit uv.lock)
+# uv.lock

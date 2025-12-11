@@ -1,87 +1,189 @@
-# LLM Council
+# Circle of Trust (LLM Council)
 
-![llmcouncil](header.jpg)
+A multi-LLM advisory system that consults multiple AI models and synthesizes their responses through a 3-stage council process. Think of it as your personal "council of advisors" where multiple AI perspectives are combined to give you more balanced, thoughtful answers.
 
-The idea of this repo is that instead of asking a question to your favorite LLM provider (e.g. OpenAI GPT 5.1, Google Gemini 3.0 Pro, Anthropic Claude Sonnet 4.5, xAI Grok 4, eg.c), you can group them into your "LLM Council". This repo is a simple, local web app that essentially looks like ChatGPT except it uses OpenRouter to send your query to multiple LLMs, it then asks them to review and rank each other's work, and finally a Chairman LLM produces the final response.
+## Overview
 
-In a bit more detail, here is what happens when you submit a query:
+Circle of Trust orchestrates conversations with multiple LLMs (via Ollama) using a sophisticated 3-stage process:
 
-1. **Stage 1: First opinions**. The user query is given to all LLMs individually, and the responses are collected. The individual responses are shown in a "tab view", so that the user can inspect them all one by one.
-2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
-3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
+### How It Works
 
-## Vibe Code Alert
+1. **Stage 1 - Collect Responses**: Your question is sent to all configured advisor models in parallel. Each model provides its independent response.
 
-This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
+2. **Stage 2 - Peer Ranking**: Each model evaluates and ranks all the anonymized responses (including its own), providing reasoning for their rankings.
 
-## Setup
+3. **Stage 3 - Final Synthesis**: A "chairman" model aggregates the rankings and synthesizes a final, consensus response that incorporates the best insights from all advisors.
 
-### 1. Install Dependencies
+### Features
 
-The project uses [uv](https://docs.astral.sh/uv/) for project management.
+- **Multi-model consultation**: Configure multiple LLM advisors with different personalities/models
+- **Group Chat**: Have multiple AI personas discuss topics together
+- **Persona Generation**: Auto-generate detailed personas from Wikipedia for your advisors
+- **Real-time streaming**: Watch responses come in as they're generated
+- **Conversation history**: All conversations are persisted in SQLite
+- **Monitoring dashboard**: Track Ollama status and usage statistics
 
-**Backend:**
+## Prerequisites
+
+- **Python 3.10+**
+- **Node.js 18+**
+- **[uv](https://github.com/astral-sh/uv)** - Fast Python package manager
+- **[Ollama](https://ollama.ai/)** - Local LLM runtime (must be running with models pulled)
+
+## Quick Start
+
+### 1. Clone the repository
+
 ```bash
-uv sync
+git clone <repository-url>
+cd llm-council
 ```
 
-**Frontend:**
+### 2. Install dependencies
+
+**Backend (Python):**
+```bash
+uv sync
+uv pip install -e ".[dev]"
+```
+
+**Frontend (Node.js):**
 ```bash
 cd frontend
 npm install
 cd ..
 ```
 
-### 2. Configure API Key
+### 3. Start Ollama
 
-Create a `.env` file in the project root:
+Make sure Ollama is running and you have at least one model pulled:
 
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-...
+ollama serve  # In a separate terminal
+ollama pull llama3.2  # Or any model you prefer
 ```
 
-Get your API key at [openrouter.ai](https://openrouter.ai/). Make sure to purchase the credits you need, or sign up for automatic top up.
+### 4. Run the application
 
-### 3. Configure Models (Optional)
-
-Edit `backend/config.py` to customize the council:
-
-```python
-COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
-]
-
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
-```
-
-## Running the Application
-
-**Option 1: Use the start script**
 ```bash
 ./start.sh
 ```
 
-**Option 2: Run manually**
+Or run backend and frontend separately:
 
-Terminal 1 (Backend):
 ```bash
+# Terminal 1 - Backend
 uv run python -m backend.main
+
+# Terminal 2 - Frontend
+cd frontend && npm run dev
 ```
 
-Terminal 2 (Frontend):
+### 5. Open the app
+
+- **Frontend**: http://localhost:5173
+- **Backend API**: http://localhost:8001
+- **API Docs**: http://localhost:8001/docs
+
+## Running Tests
+
+### Backend Tests (pytest)
+
+```bash
+# Run all tests
+.venv/bin/pytest
+
+# Run with verbose output
+.venv/bin/pytest -v
+
+# Run specific test file
+.venv/bin/pytest tests/test_council.py
+```
+
+### Frontend Tests (Vitest)
+
 ```bash
 cd frontend
-npm run dev
+
+# Run tests once
+npm test -- --run
+
+# Run tests in watch mode
+npm test
 ```
 
-Then open http://localhost:5173 in your browser.
+## Project Structure
 
-## Tech Stack
+```
+├── backend/                 # FastAPI backend
+│   ├── main.py             # API routes and endpoints
+│   ├── council.py          # 3-stage council orchestration
+│   ├── group_chat.py       # Group chat functionality
+│   ├── ollama_client.py    # Ollama API client
+│   ├── persona_generator.py # Wikipedia-based persona generation
+│   ├── storage.py          # Database operations
+│   ├── models.py           # SQLAlchemy models
+│   ├── database.py         # Database configuration
+│   ├── config.py           # Application configuration
+│   └── tests/              # Backend unit tests
+├── frontend/               # React + Vite frontend
+│   ├── src/
+│   │   ├── App.jsx         # Main application component
+│   │   ├── api.js          # Backend API client
+│   │   └── components/     # React components
+│   └── package.json
+├── tests/                  # Integration tests
+├── data/                   # Runtime data (SQLite DB, configs)
+├── prompts/                # Custom prompt templates
+├── pyproject.toml          # Python project configuration
+├── start.sh                # Convenience startup script
+└── README.md
+```
 
-- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
-- **Frontend:** React + Vite, react-markdown for rendering
-- **Storage:** JSON files in `data/conversations/`
-- **Package Management:** uv for Python, npm for JavaScript
+## Configuration
+
+### Environment Variables
+
+Create a `.env` file in the root directory:
+
+```env
+OLLAMA_API_URL=http://localhost:11434
+```
+
+### Council Configuration
+
+Edit `data/council_config.json` to configure your advisors:
+
+```json
+{
+  "advisors": [
+    {
+      "name": "Philosopher",
+      "description": "A thoughtful philosophical advisor",
+      "model": "llama3.2"
+    },
+    {
+      "name": "Scientist", 
+      "description": "A data-driven scientific advisor",
+      "model": "llama3.2"
+    }
+  ]
+}
+```
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/conversations` | GET | List all conversations |
+| `/api/conversations` | POST | Create new conversation |
+| `/api/conversations/{id}` | GET | Get conversation details |
+| `/api/conversations/{id}/messages` | POST | Send message (triggers council) |
+| `/api/group-chats` | GET/POST | Manage group chats |
+| `/api/models` | GET | List available Ollama models |
+| `/api/monitoring` | GET | Get system status and stats |
+| `/api/council/config` | GET/PUT | Manage council configuration |
+
+## License
+
+MIT

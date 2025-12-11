@@ -41,7 +41,7 @@ export default function ChatInterface({
     return (
       <div className="chat-interface">
         <div className="empty-state">
-          <h2>Welcome to LLM Council</h2>
+          <h2>Welcome to Circle of Trust</h2>
           <p>Create a new conversation to get started</p>
         </div>
       </div>
@@ -54,7 +54,7 @@ export default function ChatInterface({
         {conversation.messages.length === 0 ? (
           <div className="empty-state">
             <h2>Start a conversation</h2>
-            <p>Ask a question to consult the LLM Council</p>
+            <p>Ask a question to consult the Circle of Trust</p>
           </div>
         ) : (
           conversation.messages.map((msg, index) => (
@@ -70,10 +70,10 @@ export default function ChatInterface({
                 </div>
               ) : (
                 <div className="assistant-message">
-                  <div className="message-label">LLM Council</div>
+                  <div className="message-label">Circle of Trust</div>
 
                   {/* Stage 1 */}
-                  {msg.loading?.stage1 && (
+                  {msg.loading?.stage1 && !msg.stage1 && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 1: Collecting individual responses...</span>
@@ -82,7 +82,7 @@ export default function ChatInterface({
                   {msg.stage1 && <Stage1 responses={msg.stage1} />}
 
                   {/* Stage 2 */}
-                  {msg.loading?.stage2 && (
+                  {msg.loading?.stage2 && !msg.stage2 && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 2: Peer rankings...</span>
@@ -97,7 +97,7 @@ export default function ChatInterface({
                   )}
 
                   {/* Stage 3 */}
-                  {msg.loading?.stage3 && (
+                  {msg.loading?.stage3 && !msg.stage3 && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 3: Final synthesis...</span>
