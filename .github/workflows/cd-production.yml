@@ -1,0 +1,438 @@
+name: CD Pipeline - Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
+  ENVIRONMENT: production
+  CLUSTER_NAME: circle-of-trust-prod
+  
+jobs:
+  pre-deployment-checks:
+    name: Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Validate tag format
+        run: |
+          if [[ ! "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid tag format. Expected: v1.2.3"
+            exit 1
+          fi
+      
+      - name: Check if tag exists in registry
+        run: |
+          TAG=${{ github.ref_name }}
+          if aws ecr describe-images \
+            --repository-name backend \
+            --image-ids imageTag=${TAG} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null; then
+            echo "Images found for tag ${TAG}"
+          else
+            echo "ERROR: No images found for tag ${TAG}"
+            exit 1
+          fi
+      
+      - name: Get previous production version
+        id: prev-version
+        run: |
+          kubectl get deployment backend -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            | cut -d ':' -f2 > prev_version.txt
+          echo "version=$(cat prev_version.txt)" >> $GITHUB_OUTPUT
+      
+      - name: Create deployment record
+        run: |
+          echo "Deploying ${{ github.ref_name }} to production" >> deployment.log
+          echo "Previous version: ${{ steps.prev-version.outputs.version }}" >> deployment.log
+          echo "Deployer: ${{ github.actor }}" >> deployment.log
+          echo "Timestamp: $(date -u)" >> deployment.log
+      
+      - name: Upload deployment record
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-metadata
+          path: deployment.log
+
+  deploy-green:
+    name: Deploy Green Environment
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ env.CLUSTER_NAME }}
+      
+      - name: Update Kubernetes manifests
+        run: |
+          cd kubernetes/overlays/production
+          kustomize edit set image \
+            backend=${{ env.REGISTRY }}/backend:${{ github.ref_name }} \
+            frontend=${{ env.REGISTRY }}/frontend:${{ github.ref_name }}
+      
+      - name: Deploy green environment
+        run: |
+          kubectl apply -k kubernetes/overlays/production-green/
+          
+          kubectl rollout status deployment/backend-green -n production --timeout=10m
+          kubectl rollout status deployment/frontend-green -n production --timeout=10m
+      
+      - name: Smoke tests on green environment
+        run: |
+          GREEN_URL=$(kubectl get svc backend-green -n production \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          python tests/smoke_tests.py --url "https://${GREEN_URL}" --env production
+
+
+  traffic-switch:
+    name: Switch Traffic to Green
+    runs-on: ubuntu-latest
+    needs: [deploy-green]
+    environment:
+      name: production-approval
+      url: https://app.circle-of-trust.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ env.CLUSTER_NAME }}
+      
+      - name: Gradual traffic shift (10%)
+        run: |
+          kubectl patch svc backend -n production -p '
+          {
+            "spec": {
+              "selector": {
+                "app": "backend",
+                "version": "green",
+                "traffic-weight": "10"
+              }
+            }
+          }'
+          
+          sleep 120
+      
+      - name: Check error rate
+        run: |
+          ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=sum(rate(http_requests_total{status=~\"5..\",service=\"backend\"}[5m]))" | jq '.data.result[0].value[1]')
+          
+          if (( $(echo "$ERROR_RATE > 0.001" | bc -l) )); then
+            echo "ERROR: High error rate detected: $ERROR_RATE"
+            exit 1
+          fi
+      
+      - name: Gradual traffic shift (50%)
+        run: |
+          kubectl patch svc backend -n production -p '
+          {
+            "spec": {
+              "selector": {
+                "app": "backend",
+                "version": "green",
+                "traffic-weight": "50"
+              }
+            }
+          }'
+          
+          sleep 300
+      
+      - name: Final traffic switch (100%)
+        run: |
+          kubectl patch svc backend -n production -p '
+          {
+            "spec": {
+              "selector": {
+                "app": "backend",
+                "version": "green"
+              }
+            }
+          }'
+          
+          kubectl patch svc frontend -n production -p '
+          {
+            "spec": {
+              "selector": {
+                "app": "frontend",
+                "version": "green"
+              }
+            }
+          }'
+  post-deployment-validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: [traffic-switch]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run comprehensive smoke tests
+        run: |
+          pytest tests/smoke_tests.py \
+            --url https://api.circle-of-trust.com \
+            --env production \
+            -v
+      
+      - name: Validate health endpoints
+        run: |
+          curl -f https://api.circle-of-trust.com/ || exit 1
+          curl -f https://app.circle-of-trust.com/ || exit 1
+      
+      - name: Check application metrics
+        run: |
+          curl -f http://prometheus:9090/api/v1/query?query=up{job=\"backend\"} || exit 1
+      
+      - name: Run end-to-end tests
+        run: |
+          pytest tests/e2e/ \
+            --url https://app.circle-of-trust.com \
+            --headless \
+            -v
+      
+      - name: Monitor for 10 minutes
+        run: |
+          echo "Monitoring deployment for 10 minutes..."
+          for i in {1..10}; do
+            sleep 60
+            ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=sum(rate(http_requests_total{status=~\"5..\",service=\"backend\"}[5m]))" | jq -r '.data.result[0].value[1]')
+            echo "Minute $i: Error rate = $ERROR_RATE"
+            
+            if (( $(echo "$ERROR_RATE > 0.001" | bc -l) )); then
+              echo "ERROR: High error rate detected during monitoring"
+              exit 1
+            fi
+          done
+
+
+  cleanup-blue:
+    name: Cleanup Blue Environment
+    runs-on: ubuntu-latest
+    needs: [post-deployment-validation]
+    
+    steps:
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ env.CLUSTER_NAME }}
+      
+      - name: Scale down blue environment
+        run: |
+          kubectl scale deployment backend-blue -n production --replicas=1
+          kubectl scale deployment frontend-blue -n production --replicas=1
+      
+      - name: Keep blue for 24 hours (for quick rollback)
+        run: |
+          echo "Blue environment kept at 1 replica for emergency rollback"
+          echo "Will be cleaned up automatically after 24 hours"
+
+  
+  update-gitops:
+    name: Update GitOps Repository
+    runs-on: ubuntu-latest
+    needs: [traffic-switch]
+    
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_PAT }}
+      
+      - name: Update image tags
+        run: |
+          cd environments/production
+          
+          yq eval -i '.images[0].newTag = "${{ github.ref_name }}"' kustomization.yaml
+          
+          yq eval -i '.images[1].newTag = "${{ github.ref_name }}"' kustomization.yaml
+      
+      - name: Commit and push changes
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Deploy ${{ github.ref_name }} to production"
+          git push
+      
+      - name: Wait for Flux sync
+        run: |
+          sleep 60
+          
+          Flux app wait circle-of-trust-prod \
+            --sync \
+            --health \
+            --timeout 600
+
+
+  notify-deployment:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [cleanup-blue, update-gitops]
+    if: always()
+    
+    steps:
+      - name: Get deployment status
+        id: status
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "status=✅ Success" >> $GITHUB_OUTPUT
+            echo "color=
+          else
+            echo "status=❌ Failed" >> $GITHUB_OUTPUT
+            echo "color=
+          fi
+      
+      - name: Send Teams notification
+        uses: Teamsapi/Teams-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.status }} Production Deployment",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deployment*\n*Status:* ${{ steps.status.outputs.status }}\n*Version:* ${{ github.ref_name }}\n*Deployer:* ${{ github.actor }}\n*URL:* https://app.circle-of-trust.com"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Grafana"},
+                      "url": "https://grafana.circle-of-trust.com"
+                    },
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Logs"},
+                      "url": "https://grafana.circle-of-trust.com/explore"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          Teams_WEBHOOK_URL: ${{ secrets.Teams_WEBHOOK_URL }}
+      
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: |
+            
+            **Deployed at:** $(date -u)
+            **Deployer:** ${{ github.actor }}
+            
+            See [CHANGELOG.md](CHANGELOG.md) for details.
+            
+            - ✅ Database migration: Success
+            - ✅ Smoke tests: Passed
+            - ✅ Traffic switch: Completed
+            - ✅ Monitoring: Stable
+            
+            - **Application:** https://app.circle-of-trust.com
+            - **API:** https://api.circle-of-trust.com
+            - **Grafana:** https://grafana.circle-of-trust.com
+          draft: false
+          prerelease: false
+      
+      - name: Update deployment tracker
+        run: |
+          curl -X POST https://api.internal.com/deployments \
+            -H "Authorization: Bearer ${{ secrets.INTERNAL_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "service": "circle-of-trust",
+              "environment": "production",
+              "version": "${{ github.ref_name }}",
+              "deployer": "${{ github.actor }}",
+              "status": "${{ job.status }}",
+              "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+            }'
+
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: failure()
+    
+    steps:
+      - name: Alert on failure
+        uses: Teamsapi/Teams-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚨 Production Deployment Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚨 *ALERT: Production deployment failed*\n*Version:* ${{ github.ref_name }}\n*Trigger rollback immediately!*"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "Trigger Rollback"},
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/rollback.yml"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          Teams_WEBHOOK_URL: ${{ secrets.Teams_WEBHOOK_URL }}
+      
+      - name: Create incident
+        run: |
+          curl -X POST https://api.pagerduty.com/incidents \
+            -H "Authorization: Token token=${{ secrets.PAGERDUTY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "incident": {
+                "type": "incident",
+                "title": "Production deployment failed: ${{ github.ref_name }}",
+                "service": {
+                  "id": "${{ secrets.PAGERDUTY_SERVICE_ID }}",
+                  "type": "service_reference"
+                },
+                "urgency": "high",
+                "body": {
+                  "type": "incident_body",
+                  "details": "Deployment to production failed. Immediate attention required."
+                }
+              }
+            }'

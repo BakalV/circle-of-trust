@@ -1,0 +1,255 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+      version:
+        description: 'Version to rollback to (e.g., v1.2.3)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
+  
+jobs:
+  validate-rollback:
+    name: Validate Rollback Request
+    runs-on: ubuntu-latest
+    
+    outputs:
+      can-rollback: ${{ steps.check.outputs.can-rollback }}
+      current-version: ${{ steps.check.outputs.current-version }}
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name circle-of-trust-${{ inputs.environment }}
+      
+      - name: Check current version
+        id: check
+        run: |
+          CURRENT=$(kubectl get deployment backend -n ${{ inputs.environment }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d':' -f2)
+          echo "current-version=$CURRENT" >> $GITHUB_OUTPUT
+          
+          if aws ecr describe-images \
+            --repository-name backend \
+            --image-ids imageTag=${{ inputs.version }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null; then
+            echo "can-rollback=true" >> $GITHUB_OUTPUT
+          else
+            echo "can-rollback=false" >> $GITHUB_OUTPUT
+            echo "ERROR: Version ${{ inputs.version }} not found in registry"
+            exit 1
+          fi
+      
+      - name: Create rollback audit log
+        run: |
+          echo "=== ROLLBACK REQUEST ===" >> rollback.log
+          echo "Environment: ${{ inputs.environment }}" >> rollback.log
+          echo "Current Version: ${{ steps.check.outputs.current-version }}" >> rollback.log
+          echo "Target Version: ${{ inputs.version }}" >> rollback.log
+          echo "Requested by: ${{ github.actor }}" >> rollback.log
+          echo "Reason: ${{ inputs.reason }}" >> rollback.log
+          echo "Timestamp: $(date -u)" >> rollback.log
+      
+      - name: Upload rollback log
+        uses: actions/upload-artifact@v3
+        with:
+          name: rollback-audit
+          path: rollback.log
+
+  execute-rollback:
+    name: Execute Rollback
+    runs-on: ubuntu-latest
+    needs: [validate-rollback]
+    if: needs.validate-rollback.outputs.can-rollback == 'true'
+    environment:
+      name: ${{ inputs.environment }}-rollback
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name circle-of-trust-${{ inputs.environment }}
+      
+      - name: Create database backup before rollback
+        run: |
+          BACKUP_NAME="pre-rollback-$(date +%Y%m%d-%H%M%S)"
+          aws rds create-db-snapshot \
+            --db-instance-identifier circle-of-trust-${{ inputs.environment }} \
+            --db-snapshot-identifier $BACKUP_NAME \
+            --region ${{ secrets.AWS_REGION }}
+          
+          echo "Database backup created: $BACKUP_NAME"
+      
+      - name: Update deployments to target version
+        run: |
+          kubectl set image deployment/backend \
+            backend=${{ env.REGISTRY }}/backend:${{ inputs.version }} \
+            -n ${{ inputs.environment }}
+          
+          kubectl set image deployment/frontend \
+            frontend=${{ env.REGISTRY }}/frontend:${{ inputs.version }} \
+            -n ${{ inputs.environment }}
+          
+          kubectl annotate deployment/backend \
+            rollback.timestamp="$(date -u)" \
+            rollback.from-version="${{ needs.validate-rollback.outputs.current-version }}" \
+            rollback.to-version="${{ inputs.version }}" \
+            rollback.by="${{ github.actor }}" \
+            rollback.reason="${{ inputs.reason }}" \
+            -n ${{ inputs.environment }}
+      
+      - name: Wait for rollback completion
+        run: |
+          echo "Waiting for backend rollback..."
+          kubectl rollout status deployment/backend \
+            -n ${{ inputs.environment }} \
+            --timeout=10m
+          
+          echo "Waiting for frontend rollback..."
+          kubectl rollout status deployment/frontend \
+            -n ${{ inputs.environment }} \
+            --timeout=5m
+      
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          
+          if [ "${{ inputs.environment }}" == "production" ]; then
+            URL="https://api.circle-of-trust.com"
+          else
+            URL="https://api-${{ inputs.environment }}.circle-of-trust.com"
+          fi
+          
+          curl -f $URL/ || exit 1
+          
+          pytest tests/smoke_tests.py --url $URL -v
+      
+      - name: Monitor for 5 minutes
+        run: |
+          echo "Monitoring rolled-back deployment..."
+          for i in {1..5}; do
+            sleep 60
+            HEALTH=$(curl -s https://api.circle-of-trust.com/ | jq -r '.status')
+            echo "Minute $i: Health = $HEALTH"
+            
+            if [ "$HEALTH" != "ok" ]; then
+              echo "ERROR: Service unhealthy after rollback"
+              exit 1
+            fi
+          done
+
+  notify-rollback:
+    name: Notify Rollback Status
+    runs-on: ubuntu-latest
+    needs: [execute-rollback, validate-rollback]
+    if: always()
+    
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [ "${{ needs.execute-rollback.result }}" == "success" ]; then
+            echo "status=✅ Rollback Successful" >> $GITHUB_OUTPUT
+            echo "color=
+          else
+            echo "status=❌ Rollback Failed" >> $GITHUB_OUTPUT
+            echo "color=
+          fi
+      
+      - name: Send Teams notification
+        uses: Teamsapi/Teams-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Rollback Executed*\n*Status:* ${{ steps.status.outputs.status }}\n*Environment:* ${{ inputs.environment }}\n*From:* ${{ needs.validate-rollback.outputs.current-version }}\n*To:* ${{ inputs.version }}\n*Reason:* ${{ inputs.reason }}\n*By:* ${{ github.actor }}"
+                  }
+                }
+              ],
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "fields": [
+                    {
+                      "title": "Action Required",
+                      "value": "Review application logs and metrics",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          Teams_WEBHOOK_URL: ${{ secrets.Teams_WEBHOOK_URL }}
+      
+      - name: Create incident post-mortem template
+        if: always()
+        run: |
+          cat > postmortem.md << EOF
+          
+          - **Date**: $(date -u)
+          - **Environment**: ${{ inputs.environment }}
+          - **Previous Version**: ${{ needs.validate-rollback.outputs.current-version }}
+          - **Rolled Back To**: ${{ inputs.version }}
+          - **Triggered By**: ${{ github.actor }}
+          - **Reason**: ${{ inputs.reason }}
+          
+          - **Rollback Initiated**: $(date -u)
+          - **Rollback Completed**: TODO
+          - **Service Restored**: TODO
+          
+          TODO: Describe what went wrong
+          
+          - **Users Affected**: TODO
+          - **Duration**: TODO
+          - **Service Degradation**: TODO
+          
+          Rolled back to previous stable version ${{ inputs.version }}
+          
+          - [ ] Investigate root cause of failure
+          - [ ] Update tests to catch this issue
+          - [ ] Review deployment process
+          - [ ] Schedule post-mortem meeting
+          
+          TODO: What can we improve?
+          EOF
+          
+          echo "Post-mortem template created"
+      
+      - name: Upload post-mortem template
+        uses: actions/upload-artifact@v3
+        with:
+          name: postmortem-template
+          path: postmortem.md
